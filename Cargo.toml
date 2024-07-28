@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["xtask", "http-monitor", "http-monitor-common"]

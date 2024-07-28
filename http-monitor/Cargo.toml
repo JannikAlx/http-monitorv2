@@ -1,0 +1,20 @@
+[package]
+name = "http-monitor"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+aya = "0.12"
+aya-log = "0.2"
+http-monitor-common = { path = "../http-monitor-common", features = ["user"] }
+anyhow = "1"
+env_logger = "0.10"
+libc = "0.2"
+log = "0.4"
+tokio = { version = "1.25", features = ["full"] }
+bytes = "1.6.1"
+
+[[bin]]
+name = "http-monitor"
+path = "src/main.rs"
