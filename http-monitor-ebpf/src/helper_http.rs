@@ -3,7 +3,7 @@ use core::ptr::read_unaligned;
 use core::str::{from_raw_parts, from_utf8_unchecked};
 use aya_ebpf::bindings::__u32;
 use aya_ebpf_cty::c_void;
-use aya_ebpf::helpers::{bpf_get_retval, bpf_ktime_get_ns, bpf_map_update_elem};
+use aya_ebpf::helpers::{bpf_get_current_comm, bpf_get_retval, bpf_ktime_get_ns, bpf_map_update_elem};
 use aya_ebpf::helpers::gen::{bpf_probe_read, bpf_probe_read_user};
 use aya_ebpf::memset;
 use aya_ebpf::programs::{RawTracePointContext, TracePointContext};
@@ -17,7 +17,7 @@ pub fn gen_tgid_fd(pid: u32, ret_fd: u32) -> u64 {
 }
 
 #[inline]
-pub fn is_http_connection(conn_info: &mut ConnInfo, buf: [u8; 16], byte_count: isize) -> bool {
+pub fn is_http_connection(conn_info: &ConnInfo, buf: [u8; 16], byte_count: isize) -> bool {
     if conn_info.is_http == 1 {
         return true;
     }
@@ -37,21 +37,27 @@ pub fn is_http_connection(conn_info: &mut ConnInfo, buf: [u8; 16], byte_count: i
         if str_buf.starts_with("POST") {
             res = true;
         }
-        if res = true {
-            conn_info.is_http = 1;
-        }
         res
     }
 }
 
 #[inline]
-pub fn perf_submit_buf(ctx: &TracePointContext, direction: TrafficDirection, buf: &[u8], conn_info: &ConnInfo, event: &mut SocketDataEvent, offset: usize) {
+pub fn perf_submit_buf(ctx: &TracePointContext, direction: TrafficDirection, buf: &[u8], conn_info: &ConnInfo, event: &mut SocketDataEvent, offset: usize, pid_fd: u64) {
+
+    let new_conn_info = &mut ConnInfo {
+        conn_id: conn_info.conn_id,
+        wr_bytes: conn_info.wr_bytes,
+        rd_bytes: conn_info.rd_bytes,
+        is_http: 1,
+    };
+
     match direction {
+
         TrafficDirection::IN => {
-            event.attributes.pos = conn_info.wr_bytes + offset as u64;
+            event.attributes.pos = new_conn_info.wr_bytes + offset as u64;
         }
         TrafficDirection::OUT => {
-            event.attributes.pos = conn_info.rd_bytes + offset as u64;
+            event.attributes.pos = new_conn_info.rd_bytes + offset as u64;
         }
     }
 
@@ -72,17 +78,19 @@ pub fn perf_submit_buf(ctx: &TracePointContext, direction: TrafficDirection, buf
             event.attributes.msg_size = amount_copied as u32;
             SOCKET_DATA_EVENTS.output(ctx, &event, 0)
         }
+        CONN_INFO_MAP.insert(&pid_fd, &new_conn_info, 0).unwrap();
     }
 }
 
 #[inline]
-pub fn perf_submit_wrapper(
+fn perf_submit_wrapper(
     ctx: &TracePointContext,
     direction: TrafficDirection,
-    buf: &[u8],
+    buf: *const u8,
     buf_size: usize,
     conn_info: &mut ConnInfo,
     event: &mut SocketDataEvent,
+    pid_fd: u64,
 ) {
     let mut bytes_sent = 0;
 
@@ -94,7 +102,11 @@ pub fn perf_submit_wrapper(
             bytes_remaining
         };
 
-        perf_submit_buf(ctx, direction, &buf[bytes_sent..bytes_sent + current_size], conn_info, event, bytes_sent);
+        let mut buf_to_be_read = [0u8; MAX_MSG_SIZE];
+        unsafe {
+            bpf_probe_read(buf_to_be_read.as_mut_ptr() as *mut _, current_size as __u32, buf.add(bytes_sent) as *const _);
+        }
+        perf_submit_buf(ctx, direction, &buf[bytes_sent..bytes_sent + current_size], conn_info, event, bytes_sent, pid_fd);
         bytes_sent += current_size;
 
         if buf_size == bytes_sent {
@@ -102,6 +114,8 @@ pub fn perf_submit_wrapper(
         }
     }
 }
+
+
 
 #[inline]
 pub fn process_syscall_accept(ctx: &TracePointContext, id: u64, args: &AcceptArgs) {
@@ -191,13 +205,11 @@ pub fn process_data(ctx: &TracePointContext, id: u64, direction: TrafficDirectio
         //info!(ctx, "Accessing conn pid_fd: {}", pid_fd);
 
         let conn_info_retrieved = CONN_INFO_MAP.get(&pid_fd);
-        let conn_info_ptr = CONN_INFO_MAP.get_ptr_mut(&pid_fd);
-        if conn_info_ptr.unwrap().is_null() {
+        if conn_info_retrieved.is_none() {
             //warn!(ctx, "Failed to get conn info for key: {}", pid_fd);
             return;
         }
-        let mut conn_info = conn_info_ptr.unwrap();
-
+        let conn_info = conn_info_retrieved.unwrap();
 
         //info!(ctx, "Accessing conn pid: {}", conn_info.conn_id.pid);
         let mut buf_read = [0u8; 16];
@@ -207,10 +219,12 @@ pub fn process_data(ctx: &TracePointContext, id: u64, direction: TrafficDirectio
             args.buf as *const _,
         );
         if is_http_connection(conn_info, buf_read, bytes_count) {
-            info!(ctx, "HTTP connection detected");
+            let comm = bpf_get_current_comm().unwrap();
+            let comm_name = from_utf8_unchecked(&comm);
+            info!(ctx, "HTTP connection detected for comm: {}", comm_name);
             let k_zero: u32 = 0;
 
-            let event: &mut SocketDataEvent = &mut SocketDataEvent {
+            let mut event: &mut SocketDataEvent = &mut SocketDataEvent {
                 attributes: Attributes {
                     timestamp: bpf_ktime_get_ns(),
                     conn_id: conn_info.conn_id,
@@ -221,11 +235,17 @@ pub fn process_data(ctx: &TracePointContext, id: u64, direction: TrafficDirectio
                 msg: [0u8; MAX_MSG_SIZE],
             };
 
-            perf_submit_wrapper(ctx, direction, args.buf, bytes_count as usize, conn_info, event);
+            perf_submit_wrapper(ctx, direction, args.buf, bytes_count as usize, conn_info, event, pid_fd);
         }
+        let mut new_conn_info = ConnInfo {
+            conn_id: conn_info.conn_id,
+            wr_bytes: conn_info.wr_bytes,
+            rd_bytes: conn_info.rd_bytes,
+            is_http: 1,
+        };
         match direction {
-            TrafficDirection::OUT => conn_info.wr_bytes += bytes_count as u64,
-            TrafficDirection::IN => conn_info.rd_bytes += bytes_count as u64,
+            TrafficDirection::OUT => new_conn_info.wr_bytes += bytes_count as u64,
+            TrafficDirection::IN => new_conn_info.rd_bytes += bytes_count as u64,
         }
         // Update the connection info
         let res = CONN_INFO_MAP.insert(&pid_fd, &conn_info, 0);

@@ -6,7 +6,7 @@ use log::{info, warn, debug, error};
 use tokio::signal;
 use tokio::time::{self, Duration};
 use tokio::io::unix::{AsyncFd, AsyncFdReadyGuard, AsyncFdReadyMutGuard};
-use http_monitor_common::{DataOut, SocketDataEvent, SocketOpenEvent};
+use http_monitor_common::{DataOut, SocketCloseEvent, SocketDataEvent, SocketOpenEvent};
 use std::convert::TryFrom;
 use aya::util::online_cpus;
 use bytes::BytesMut;
@@ -56,9 +56,11 @@ async fn try_main() -> anyhow::Result<()> {
     // Process events from the perf buffer
     let cpus = online_cpus()?;
     let num_cpus = cpus.len();
-    let mut events = AsyncPerfEventArray::try_from(bpf.take_map("SOCKET_OPEN_EVENTS").unwrap())?;
+    let mut open_events = AsyncPerfEventArray::try_from(bpf.take_map("SOCKET_OPEN_EVENTS").unwrap())?;
+    let mut close_events: AsyncPerfEventArray<MapData> = AsyncPerfEventArray::try_from(bpf.take_map("SOCKET_CLOSE_EVENTS").unwrap())?;
     for cpu in cpus {
-        let mut buf = events.open(cpu, None)?;
+        let mut buf_open = open_events.open(cpu, None)?;
+        let mut buf_close = close_events.open(cpu, None)?;
 
         tokio::task::spawn(async move {
             let mut buffers = (0..num_cpus)
@@ -66,14 +68,21 @@ async fn try_main() -> anyhow::Result<()> {
                 .collect::<Vec<_>>();
 
             loop {
-                let events = buf.read_events(&mut buffers).await.unwrap();
+                let events = buf_open.read_events(&mut buffers).await.unwrap();
                 for i in 0..events.read {
 
                     // read the event
                     let buf = &mut buffers[i];
-                    let ptr = buf.as_ptr() as *const SocketDataEvent;
+                    let ptr = buf.as_ptr() as *const SocketOpenEvent;
                     let data = unsafe { ptr.read_unaligned() };
-                    //info!("Received event from pid: {}", data.attributes.conn_id.pid);
+                    info!("Socket opened, pid: {}", data.conn_id.pid);
+                }
+                let events = buf_close.read_events(&mut buffers).await.unwrap();
+                for i in 0..events.read {
+                    let buf = &mut buffers[i];
+                    let ptr = buf.as_ptr() as *const SocketCloseEvent;
+                    let data = unsafe { ptr.read_unaligned() };
+                    info!("Socket closed, pid: {}", data.conn_id.pid);
                 }
             }
         });
