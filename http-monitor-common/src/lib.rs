@@ -18,7 +18,7 @@ pub struct ConnId {
     // Process ID
     pub pid: u32,
     // The file descriptor to the opened network connection.
-    pub fd: i32,
+    pub fd: u32,
     pub creation_time: u64,
 }
 
@@ -50,14 +50,14 @@ pub struct AcceptArgs {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DataArgs {
-    pub fd: __s32,
+    pub fd: u32,
     pub buf: *const u8,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CloseArgs {
-    pub fd: i32,
+    pub fd: u32,
 }
 
 #[repr(C)]

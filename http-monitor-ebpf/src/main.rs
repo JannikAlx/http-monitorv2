@@ -6,7 +6,7 @@ mod maps_http;
 mod helper_http;
 
 use core::ptr::{null, write};
-use http_monitor_common::{DataArgs, sockaddr_in};
+use http_monitor_common::{DataArgs, sockaddr_in, TrafficDirection};
 
 use core::str::from_utf8_unchecked;
 use aya_ebpf::{
@@ -22,7 +22,7 @@ use aya_ebpf::maps::ring_buf::RingBuf;
 use aya_ebpf::programs::{BtfTracePointContext, RawTracePointContext};
 use http_monitor_common::AcceptArgs;
 use http_monitor_common::TrafficDirection::OUT;
-use crate::helper_http::{process_data, process_syscall_accept};
+use crate::helper_http::*;
 use crate::maps_http::{ACTIVE_ACCEPT_ARGS_MAP, ACTIVE_WRITE_ARGS_MAP};
 //MAPS
 
@@ -44,10 +44,9 @@ fn try_http_monitor(ctx: TracePointContext) -> Result<u32, u32> {
         let comm_string = from_utf8_unchecked(&comm);
         info!(&ctx, "Comm: {}", comm_string);
         if !comm_string.contains("systemd") {
-            if RING_BUF1.output(&comm_string,0).is_ok() {
+            if RING_BUF1.output(&comm_string, 0).is_ok() {
                 info!(&ctx, "Saved item to RingBuffer")
             }
-
         }
     }
     Ok(0)
@@ -57,7 +56,7 @@ fn try_http_monitor(ctx: TracePointContext) -> Result<u32, u32> {
 fn syscall_probe_entry_accept(ctx: TracePointContext) -> i32 {
     let id = bpf_get_current_pid_tgid();
     unsafe {
-        let addr :sockaddr = ctx.read_at(24).unwrap();
+        let addr: sockaddr = ctx.read_at(24).unwrap();
 
         let accept_args: AcceptArgs = AcceptArgs {
             addr
@@ -71,7 +70,7 @@ fn syscall_probe_entry_accept(ctx: TracePointContext) -> i32 {
 fn syscall_probe_entry_accept4(ctx: TracePointContext) -> i32 {
     let id = bpf_get_current_pid_tgid();
     unsafe {
-        let addr :sockaddr = ctx.read_at(24).unwrap();
+        let addr: sockaddr = ctx.read_at(24).unwrap();
 
         let accept_args: AcceptArgs = AcceptArgs {
             addr
@@ -113,12 +112,33 @@ fn syscall_probe_ret_accept4(ctx: TracePointContext) -> i32 {
     0
 }
 
+#[tracepoint]
+fn syscall_probe_ret_write(ctx: TracePointContext) -> i32 {
+    let id = bpf_get_current_pid_tgid();
+    unsafe {
+        //apparently ret_fd also the byte_size??
+        let bytes_count: isize = ctx.read_at(16).unwrap_or_default();
+        let write_args = ACTIVE_WRITE_ARGS_MAP.get(&id);
+        if write_args.is_some() {
+            let args = write_args.unwrap();
+            process_data(&ctx, id, OUT, args, bytes_count)
+        }
+        else {
+            error! {&ctx, "Failed to get write args from map"}
+        }
+        if ACTIVE_WRITE_ARGS_MAP.remove(&id).is_err() {
+            error! {&ctx, "Failed to remove write args from map"}
+        }
+        0
+    }
+}
+
 // original signature: ssize_t write(int fd, const void *buf, size_t count);
 #[tracepoint]
 fn syscall_probe_entry_write(ctx: TracePointContext) -> i32 {
     let id = bpf_get_current_pid_tgid();
     unsafe {
-        let fd: i32 = ctx.read_at(16).unwrap_or_default();
+        let fd: u32 = ctx.read_at(16).unwrap_or_default();
         //makes verifier mad if not default
         let buf: *const u8 = ctx.read_at(24).unwrap_or(null::<u8>());
 
@@ -130,7 +150,6 @@ fn syscall_probe_entry_write(ctx: TracePointContext) -> i32 {
     };
     0
 }
-
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {

@@ -73,7 +73,7 @@ async fn try_main() -> anyhow::Result<()> {
                     let buf = &mut buffers[i];
                     let ptr = buf.as_ptr() as *const SocketDataEvent;
                     let data = unsafe { ptr.read_unaligned() };
-                    info!("Received event from pid: {}", data.attributes.conn_id.pid);
+                    //info!("Received event from pid: {}", data.attributes.conn_id.pid);
                 }
             }
         });
@@ -104,6 +104,8 @@ fn load_programs(bpf: &mut Bpf) -> anyhow::Result<()> {
     let program: &mut TracePoint = bpf.program_mut("syscall_probe_entry_write").unwrap().try_into()?;
     program.load()?;
     program.attach("syscalls", "sys_enter_write")?;
-
+    let program: &mut TracePoint = bpf.program_mut("syscall_probe_ret_write").unwrap().try_into()?;
+    program.load()?;
+    program.attach("syscalls", "sys_exit_write")?;
     Ok(())
 }

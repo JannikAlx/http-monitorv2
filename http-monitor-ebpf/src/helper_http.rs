@@ -1,47 +1,51 @@
 use core::ops::Deref;
-use core::str::from_raw_parts;
+use core::ptr::read_unaligned;
+use core::str::{from_raw_parts, from_utf8_unchecked};
 use aya_ebpf::bindings::__u32;
 use aya_ebpf_cty::c_void;
 use aya_ebpf::helpers::{bpf_get_retval, bpf_ktime_get_ns, bpf_map_update_elem};
-use aya_ebpf::helpers::gen::bpf_probe_read;
+use aya_ebpf::helpers::gen::{bpf_probe_read, bpf_probe_read_user};
+use aya_ebpf::memset;
 use aya_ebpf::programs::{RawTracePointContext, TracePointContext};
-use aya_log_ebpf::{error, info};
+use aya_log_ebpf::{error, info, warn};
 use http_monitor_common::{AcceptArgs, Attributes, CHUNK_LIMIT, CloseArgs, ConnId, ConnInfo, DataArgs, MAX_MSG_SIZE, SocketCloseEvent, SocketDataEvent, SocketOpenEvent, TrafficDirection};
 use crate::maps_http::{CONN_INFO_MAP, SOCKET_CLOSE_EVENTS, SOCKET_DATA_EVENT_BUFFER_HEAP, SOCKET_DATA_EVENTS, SOCKET_OPEN_EVENTS};
 
 #[inline]
-fn gen_tgid_fd(pid: u32, ret_fd: i32) -> u64 {
+pub fn gen_tgid_fd(pid: u32, ret_fd: u32) -> u64 {
     ((pid as u64) << 32) | (ret_fd as u64)
 }
 
 #[inline]
-fn is_http_connection(conn_info: &mut ConnInfo, buf: &[u8]) -> bool {
-    //TODO: check if we have an actual buffer, or just a pointer
+pub fn is_http_connection(conn_info: &mut ConnInfo, buf: [u8; 16], byte_count: isize) -> bool {
     if conn_info.is_http == 1 {
         return true;
     }
+    unsafe {
+        if byte_count < 16 {
+            return false;
+        }
+        let mut res = false;
 
-    if buf.len() < 16 {
-        return false;
+        let str_buf = from_utf8_unchecked(&buf);
+        if str_buf.starts_with("HTTP") {
+            res = true;
+        }
+        if str_buf.starts_with("GET") {
+            res = true;
+        }
+        if str_buf.starts_with("POST") {
+            res = true;
+        }
+        if res = true {
+            conn_info.is_http = 1;
+        }
+        res
     }
-    let mut res = false;
-
-    let http = "HTTP".as_bytes();
-    let get = "GET".as_bytes();
-    let post = "POST".as_bytes();
-    if buf[0..3].eq(http) { res = true; }
-    if buf[0..2].eq(get) { res = true; }
-    if buf[0..4].eq(post) { res = true; }
-
-    if res {
-        conn_info.is_http = 1;
-    }
-
-    res
 }
 
 #[inline]
-fn perf_submit_buf(ctx: &TracePointContext, direction: TrafficDirection, buf: &[u8], conn_info: &ConnInfo, event: &mut SocketDataEvent, offset: usize) {
+pub fn perf_submit_buf(ctx: &TracePointContext, direction: TrafficDirection, buf: &[u8], conn_info: &ConnInfo, event: &mut SocketDataEvent, offset: usize) {
     match direction {
         TrafficDirection::IN => {
             event.attributes.pos = conn_info.wr_bytes + offset as u64;
@@ -59,8 +63,7 @@ fn perf_submit_buf(ctx: &TracePointContext, direction: TrafficDirection, buf: &[
     if buff_size_minus_1 < MAX_MSG_SIZE {
         event.msg[..buf.len()].copy_from_slice(buf);
         amount_copied = buf.len();
-    }
-    else {
+    } else {
         event.msg[..MAX_MSG_SIZE].copy_from_slice(&buf[..MAX_MSG_SIZE]);
         amount_copied = MAX_MSG_SIZE;
     }
@@ -70,11 +73,10 @@ fn perf_submit_buf(ctx: &TracePointContext, direction: TrafficDirection, buf: &[
             SOCKET_DATA_EVENTS.output(ctx, &event, 0)
         }
     }
-
 }
 
 #[inline]
-fn perf_submit_wrapper(
+pub fn perf_submit_wrapper(
     ctx: &TracePointContext,
     direction: TrafficDirection,
     buf: &[u8],
@@ -113,28 +115,32 @@ pub fn process_syscall_accept(ctx: &TracePointContext, id: u64, args: &AcceptArg
         }
         //let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;??
         // let pid = bpf_get_current_pid_tgid() as u32;
-        let pid: u32 = (id >> 32)  as u32;
-        let conn_id_p = ConnId{
+        let pid: u32 = (id >> 32) as u32;
+        let conn_id_p = ConnId {
             pid,
             fd: ret_fd,
-            creation_time: bpf_ktime_get_ns()
+            creation_time: bpf_ktime_get_ns(),
         };
 
         let conn_info = ConnInfo {
             conn_id: conn_id_p,
             wr_bytes: 0,
             rd_bytes: 0,
-            is_http: 0
+            is_http: 0,
         };
 
         let pid = (id >> 32) as u32;
         let pid_fd = gen_tgid_fd(pid, ret_fd);
         CONN_INFO_MAP.insert(&pid_fd, &conn_info, 0).unwrap();
 
+        if let Some(inserted_conn_info) = CONN_INFO_MAP.get(&pid_fd) {} else {
+            error!(ctx, "Failed to insert conn info for key: {}", pid_fd);
+        }
+
         let open_event = SocketOpenEvent {
             timestamp_ns: bpf_ktime_get_ns(),
             conn_id: conn_id_p,
-            addr: args.addr
+            addr: args.addr,
         };
         SOCKET_OPEN_EVENTS.output(ctx, &open_event, 0);
     }
@@ -143,7 +149,7 @@ pub fn process_syscall_accept(ctx: &TracePointContext, id: u64, args: &AcceptArg
 pub fn process_syscall_close(ctx: &TracePointContext, id: u64, args: &CloseArgs) {
     unsafe {
         info!(ctx, "Processing close syscall");
-        let ret_val: i32 = ctx.read_at(16).unwrap_or_default();
+        let ret_val: u32 = ctx.read_at(16).unwrap_or_default();
         if ret_val < 0 {
             return;
         }
@@ -161,7 +167,7 @@ pub fn process_syscall_close(ctx: &TracePointContext, id: u64, args: &CloseArgs)
             timestamp_ns: bpf_ktime_get_ns(),
             conn_id: conn_info.conn_id,
             wr_bytes: conn_info.wr_bytes,
-            rd_bytes: conn_info.rd_bytes
+            rd_bytes: conn_info.rd_bytes,
         };
 
         SOCKET_CLOSE_EVENTS.output(ctx, &close_event, 0);
@@ -172,41 +178,50 @@ pub fn process_syscall_close(ctx: &TracePointContext, id: u64, args: &CloseArgs)
 
 pub fn process_data(ctx: &TracePointContext, id: u64, direction: TrafficDirection, args: &DataArgs, bytes_count: isize) {
     if args.buf.is_null() {
+        error!(ctx, "Null buffer");
         return;
     }
 
     if bytes_count <= 0 {
         return;
     }
-
     unsafe {
         let pid = (id >> 32) as u32;
         let pid_fd = gen_tgid_fd(pid, args.fd);
-        let conn_info_ptr = match CONN_INFO_MAP.get_ptr_mut(&pid_fd) {
-            Some(conn_info_ptr) => conn_info_ptr,
-            None => return
-        };
-        let conn_info = &mut *conn_info_ptr;
+        //info!(ctx, "Accessing conn pid_fd: {}", pid_fd);
 
-        //convert pointer to buffer
-        let buf = from_raw_parts(args.buf, bytes_count as usize).as_bytes();
+        let conn_info_retrieved = CONN_INFO_MAP.get(&pid_fd);
+        let conn_info_ptr = CONN_INFO_MAP.get_ptr_mut(&pid_fd);
+        if conn_info_ptr.unwrap().is_null() {
+            //warn!(ctx, "Failed to get conn info for key: {}", pid_fd);
+            return;
+        }
+        let mut conn_info = conn_info_ptr.unwrap();
 
-        if is_http_connection(conn_info, buf) {
+
+        //info!(ctx, "Accessing conn pid: {}", conn_info.conn_id.pid);
+        let mut buf_read = [0u8; 16];
+        bpf_probe_read_user(
+            &mut buf_read as *mut _ as *mut _,
+            7,
+            args.buf as *const _,
+        );
+        if is_http_connection(conn_info, buf_read, bytes_count) {
+            info!(ctx, "HTTP connection detected");
             let k_zero: u32 = 0;
 
-            let event_ptr = SOCKET_DATA_EVENT_BUFFER_HEAP.get_ptr_mut(k_zero).unwrap();
-            if event_ptr.is_null() {
-                error!(ctx, "Failed to get mutable event buffer");
-                return;
-            }
-            let event = unsafe { &mut *event_ptr };
+            let event: &mut SocketDataEvent = &mut SocketDataEvent {
+                attributes: Attributes {
+                    timestamp: bpf_ktime_get_ns(),
+                    conn_id: conn_info.conn_id,
+                    traffic_direction: direction,
+                    msg_size: 0,
+                    pos: 0,
+                },
+                msg: [0u8; MAX_MSG_SIZE],
+            };
 
-            // Fill the metadata of the data event.
-            event.attributes.timestamp = bpf_ktime_get_ns();
-            event.attributes.traffic_direction = direction;
-            event.attributes.conn_id = conn_info.conn_id;
-
-            perf_submit_wrapper(ctx, direction, buf, bytes_count as usize, conn_info, event);
+            perf_submit_wrapper(ctx, direction, args.buf, bytes_count as usize, conn_info, event);
         }
         match direction {
             TrafficDirection::OUT => conn_info.wr_bytes += bytes_count as u64,
@@ -218,5 +233,4 @@ pub fn process_data(ctx: &TracePointContext, id: u64, direction: TrafficDirectio
             error!(ctx, "Failed to update connection info");
         }
     }
-
 }
