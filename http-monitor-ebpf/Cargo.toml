@@ -8,6 +8,7 @@ aya-ebpf = "0.1.0"
 aya-ebpf-cty = "0.2.1"
 aya-log-ebpf = "0.1.0"
 http-monitor-common = { path = "../http-monitor-common" }
+log = "0.4.22"
 
 [[bin]]
 name = "http-monitor"

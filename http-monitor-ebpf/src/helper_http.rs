@@ -2,22 +2,22 @@ use core::ops::Deref;
 use core::str::from_raw_parts;
 use aya_ebpf::bindings::__u32;
 use aya_ebpf_cty::c_void;
-use aya_ebpf::helpers::{bpf_get_retval, bpf_ktime_get_ns};
+use aya_ebpf::helpers::{bpf_get_retval, bpf_ktime_get_ns, bpf_map_update_elem};
 use aya_ebpf::helpers::gen::bpf_probe_read;
 use aya_ebpf::programs::{RawTracePointContext, TracePointContext};
-use aya_log_ebpf::error;
+use aya_log_ebpf::{error, info};
 use http_monitor_common::{AcceptArgs, Attributes, CHUNK_LIMIT, CloseArgs, ConnId, ConnInfo, DataArgs, MAX_MSG_SIZE, SocketCloseEvent, SocketDataEvent, SocketOpenEvent, TrafficDirection};
 use crate::maps_http::{CONN_INFO_MAP, SOCKET_CLOSE_EVENTS, SOCKET_DATA_EVENT_BUFFER_HEAP, SOCKET_DATA_EVENTS, SOCKET_OPEN_EVENTS};
 
 #[inline]
-fn gen_tgid_fd(tgid: u32, fd: i32) -> u64 {
-    ((tgid as u64) << 32) | (fd as u64)
+fn gen_tgid_fd(pid: u32, ret_fd: i32) -> u64 {
+    ((pid as u64) << 32) | (ret_fd as u64)
 }
 
 #[inline]
 fn is_http_connection(conn_info: &mut ConnInfo, buf: &[u8]) -> bool {
     //TODO: check if we have an actual buffer, or just a pointer
-    if conn_info.is_http {
+    if conn_info.is_http == 1 {
         return true;
     }
 
@@ -34,7 +34,7 @@ fn is_http_connection(conn_info: &mut ConnInfo, buf: &[u8]) -> bool {
     if buf[0..4].eq(post) { res = true; }
 
     if res {
-        conn_info.is_http = true;
+        conn_info.is_http = 1;
     }
 
     res
@@ -102,17 +102,20 @@ fn perf_submit_wrapper(
 }
 
 #[inline]
-pub fn process_syscall_accept(ctx: &RawTracePointContext, id: u64, args: &AcceptArgs) {
+pub fn process_syscall_accept(ctx: &TracePointContext, id: u64, args: &AcceptArgs) {
     // Implement the logic to process accept syscall
 
     unsafe {
-        let ret_fd = bpf_get_retval();
+        // offset is return fd, idk from where I have this, but it works
+        let ret_fd = ctx.read_at(16).unwrap_or_default();
         if ret_fd <= 0 {
             return;
         }
-        let pid = id >> 32;
+        //let tgid = (bpf_get_current_pid_tgid() >> 32) as u32;??
+        // let pid = bpf_get_current_pid_tgid() as u32;
+        let pid: u32 = (id >> 32)  as u32;
         let conn_id_p = ConnId{
-            pid: pid as u32,
+            pid,
             fd: ret_fd,
             creation_time: bpf_ktime_get_ns()
         };
@@ -121,15 +124,12 @@ pub fn process_syscall_accept(ctx: &RawTracePointContext, id: u64, args: &Accept
             conn_id: conn_id_p,
             wr_bytes: 0,
             rd_bytes: 0,
-            is_http: false
+            is_http: 0
         };
 
-        let pid_fd = gen_tgid_fd(pid as u32, ret_fd);
-
-        let res = CONN_INFO_MAP.insert(&pid_fd, &conn_info, 0);
-        if res.is_err() {
-            error!(ctx, "Failed to insert connection info");
-        }
+        let pid = (id >> 32) as u32;
+        let pid_fd = gen_tgid_fd(pid, ret_fd);
+        CONN_INFO_MAP.insert(&pid_fd, &conn_info, 0).unwrap();
 
         let open_event = SocketOpenEvent {
             timestamp_ns: bpf_ktime_get_ns(),
@@ -137,13 +137,13 @@ pub fn process_syscall_accept(ctx: &RawTracePointContext, id: u64, args: &Accept
             addr: args.addr
         };
         SOCKET_OPEN_EVENTS.output(ctx, &open_event, 0);
-
-        }
+    }
 }
 
-fn process_syscall_close(ctx: &TracePointContext, id: u64, args: &CloseArgs) {
+pub fn process_syscall_close(ctx: &TracePointContext, id: u64, args: &CloseArgs) {
     unsafe {
-        let ret_val = bpf_get_retval();
+        info!(ctx, "Processing close syscall");
+        let ret_val: i32 = ctx.read_at(16).unwrap_or_default();
         if ret_val < 0 {
             return;
         }
@@ -165,11 +165,12 @@ fn process_syscall_close(ctx: &TracePointContext, id: u64, args: &CloseArgs) {
         };
 
         SOCKET_CLOSE_EVENTS.output(ctx, &close_event, 0);
+        info!(ctx, "output close event");
         CONN_INFO_MAP.remove(&tgid_fd).unwrap()
     }
 }
 
-fn process_data(ctx: &TracePointContext, id: u64, direction: TrafficDirection, args: &DataArgs, bytes_count: isize) {
+pub fn process_data(ctx: &TracePointContext, id: u64, direction: TrafficDirection, args: &DataArgs, bytes_count: isize) {
     if args.buf.is_null() {
         return;
     }

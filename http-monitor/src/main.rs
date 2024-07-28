@@ -89,11 +89,21 @@ async fn try_main() -> anyhow::Result<()> {
 }
 
 fn load_programs(bpf: &mut Bpf) -> anyhow::Result<()> {
-    //let program: &mut TracePoint = bpf.program_mut("syscall_probe_entry_accept").unwrap().try_into()?;
-    //program.load()?;
-    //program.attach("syscalls", "sys_enter_accept4")?;
-    let program: &mut TracePoint = bpf.program_mut("http_monitor").unwrap().try_into()?;
+    let program: &mut TracePoint = bpf.program_mut("syscall_probe_entry_accept").unwrap().try_into()?;
     program.load()?;
-    program.attach("syscalls", "sys_enter_read")?;
+    program.attach("syscalls", "sys_enter_accept")?;
+    let program: &mut TracePoint = bpf.program_mut("syscall_probe_ret_accept").unwrap().try_into()?;
+    program.load()?;
+    program.attach("syscalls", "sys_exit_accept")?;
+    let program: &mut TracePoint = bpf.program_mut("syscall_probe_entry_accept4").unwrap().try_into()?;
+    program.load()?;
+    program.attach("syscalls", "sys_enter_accept4")?;
+    let program: &mut TracePoint = bpf.program_mut("syscall_probe_ret_accept4").unwrap().try_into()?;
+    program.load()?;
+    program.attach("syscalls", "sys_exit_accept4")?;
+    let program: &mut TracePoint = bpf.program_mut("syscall_probe_entry_write").unwrap().try_into()?;
+    program.load()?;
+    program.attach("syscalls", "sys_enter_write")?;
+
     Ok(())
 }

@@ -1,7 +1,7 @@
 #![no_std]
 
 use aya_ebpf;
-use aya_ebpf_bindings::bindings::sockaddr;
+use aya_ebpf_bindings::bindings::{__s32, sockaddr};
 
 pub const MAX_MSG_SIZE: usize = 30720;
 pub const CHUNK_LIMIT: usize = 4;
@@ -26,6 +26,7 @@ pub struct ConnId {
 // This struct contains information collected when a connection is established,
 // via an accept4() syscall.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct ConnInfo {
     // Connection identifier.
     pub conn_id: ConnId,
@@ -33,11 +34,13 @@ pub struct ConnInfo {
     pub wr_bytes: u64,
     pub rd_bytes: u64,
     // A flag indicating we identified the connection as HTTP.
-    pub is_http: bool
+    //boolean makes verifier mad lol
+    pub is_http: u64
 }
 
 // An helper struct that hold the addr argument of the syscall.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct AcceptArgs {
     pub addr: sockaddr,
 }
@@ -45,17 +48,20 @@ pub struct AcceptArgs {
 // An helper struct to cache input argument of read/write syscalls between the
 // entry hook and the exit hook.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct DataArgs {
-    pub fd: i32,
+    pub fd: __s32,
     pub buf: *const u8,
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct CloseArgs {
     pub fd: i32,
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct SocketOpenEvent {
     pub timestamp_ns: u64,
     pub conn_id: ConnId,

@@ -5,7 +5,8 @@
 mod maps_http;
 mod helper_http;
 
-use http_monitor_common::{sockaddr_in};
+use core::ptr::{null, write};
+use http_monitor_common::{DataArgs, sockaddr_in};
 
 use core::str::from_utf8_unchecked;
 use aya_ebpf::{
@@ -20,7 +21,8 @@ use aya_log_ebpf::{error, info};
 use aya_ebpf::maps::ring_buf::RingBuf;
 use aya_ebpf::programs::{BtfTracePointContext, RawTracePointContext};
 use http_monitor_common::AcceptArgs;
-use crate::helper_http::process_syscall_accept;
+use http_monitor_common::TrafficDirection::OUT;
+use crate::helper_http::{process_data, process_syscall_accept};
 use crate::maps_http::{ACTIVE_ACCEPT_ARGS_MAP, ACTIVE_WRITE_ARGS_MAP};
 //MAPS
 
@@ -65,8 +67,22 @@ fn syscall_probe_entry_accept(ctx: TracePointContext) -> i32 {
     0
 }
 
-#[raw_tracepoint]
-fn syscall_probe_ret_accept(ctx: RawTracePointContext) -> i32 {
+#[tracepoint]
+fn syscall_probe_entry_accept4(ctx: TracePointContext) -> i32 {
+    let id = bpf_get_current_pid_tgid();
+    unsafe {
+        let addr :sockaddr = ctx.read_at(24).unwrap();
+
+        let accept_args: AcceptArgs = AcceptArgs {
+            addr
+        };
+        ACTIVE_ACCEPT_ARGS_MAP.insert(&id, &accept_args, 0).map_err(|e| e as u8).unwrap();
+    };
+    0
+}
+
+#[tracepoint]
+fn syscall_probe_ret_accept(ctx: TracePointContext) -> i32 {
     let id = bpf_get_current_pid_tgid();
     unsafe {
         let accept_args = ACTIVE_ACCEPT_ARGS_MAP.get(&id);
@@ -78,7 +94,40 @@ fn syscall_probe_ret_accept(ctx: RawTracePointContext) -> i32 {
             error! {&ctx, "Failed to remove accept args from map"}
         }
     }
+    0
+}
 
+#[tracepoint]
+fn syscall_probe_ret_accept4(ctx: TracePointContext) -> i32 {
+    let id = bpf_get_current_pid_tgid();
+    unsafe {
+        let accept_args = ACTIVE_ACCEPT_ARGS_MAP.get(&id);
+        if accept_args.is_some() {
+            let args = accept_args.unwrap();
+            process_syscall_accept(&ctx, id, args)
+        }
+        if ACTIVE_ACCEPT_ARGS_MAP.remove(&id).is_err() {
+            error! {&ctx, "Failed to remove accept args from map"}
+        }
+    }
+    0
+}
+
+// original signature: ssize_t write(int fd, const void *buf, size_t count);
+#[tracepoint]
+fn syscall_probe_entry_write(ctx: TracePointContext) -> i32 {
+    let id = bpf_get_current_pid_tgid();
+    unsafe {
+        let fd: i32 = ctx.read_at(16).unwrap_or_default();
+        //makes verifier mad if not default
+        let buf: *const u8 = ctx.read_at(24).unwrap_or(null::<u8>());
+
+        let write_args = DataArgs {
+            fd,
+            buf,
+        };
+        ACTIVE_WRITE_ARGS_MAP.insert(&id, &write_args, 0).map_err(|e| e as u8).unwrap();
+    };
     0
 }
 
