@@ -88,7 +88,7 @@ fn perf_submit_wrapper(
     direction: TrafficDirection,
     buf: *const u8,
     buf_size: usize,
-    conn_info: &mut ConnInfo,
+    conn_info: &ConnInfo,
     event: &mut SocketDataEvent,
     pid_fd: u64,
 ) {
@@ -106,7 +106,7 @@ fn perf_submit_wrapper(
         unsafe {
             bpf_probe_read(buf_to_be_read.as_mut_ptr() as *mut _, current_size as __u32, buf.add(bytes_sent) as *const _);
         }
-        perf_submit_buf(ctx, direction, &buf[bytes_sent..bytes_sent + current_size], conn_info, event, bytes_sent, pid_fd);
+        perf_submit_buf(ctx, direction, &buf_to_be_read, conn_info, event, bytes_sent, pid_fd);
         bytes_sent += current_size;
 
         if buf_size == bytes_sent {
@@ -235,7 +235,7 @@ pub fn process_data(ctx: &TracePointContext, id: u64, direction: TrafficDirectio
                 msg: [0u8; MAX_MSG_SIZE],
             };
 
-            perf_submit_wrapper(ctx, direction, args.buf, bytes_count as usize, conn_info, event, pid_fd);
+            //perf_submit_wrapper(ctx, direction, args.buf, bytes_count as usize, conn_info, event, pid_fd);
         }
         let mut new_conn_info = ConnInfo {
             conn_id: conn_info.conn_id,
